@@ -157,18 +157,24 @@ const config = Buffer.from(JSON.stringify({
   codec:'avc1.4d002a', description:Buffer.from([1,77,0,42]).toString('base64'), width:320, height:200
 }));
 async function check(chunks, expected, invalid=false, overload=false) {
-  const decoded = [], status = {}, canvas = {getContext:()=>({drawImage(){}})};
+  const decoded = [], frames = [], status = {}, canvas = {getContext:()=>({drawImage(){}})};
   let queue = overload ? 9 : 0, cancelled = false;
   const sandbox = {
-    document:{getElementById:id=>id==='status'?status:canvas},
+    document:{getElementById:id=>id==='status'?status:canvas, addEventListener(){}},
+    performance:{now:()=>0}, requestAnimationFrame:()=>1, cancelAnimationFrame(){},
     TextDecoder, Uint8Array, DataView, Number, JSON, Error, isSecureContext:true,
     atob:s=>Buffer.from(s,'base64').toString('binary'),
     EncodedVideoChunk:class {constructor(o){Object.assign(this,o)}},
     VideoDecoder:class {
       state='unconfigured';
+      constructor(callbacks){this.callbacks=callbacks}
       configure(){this.state='configured'}
       get decodeQueueSize(){const value=queue; queue=0; return value}
-      decode(c){decoded.push(c)}
+      decode(c){
+        decoded.push(c);
+        const frame = {timestamp:c.timestamp,closed:0,close(){this.closed++;assert.equal(this.closed,1)}};
+        frames.push(frame); this.callbacks.output(frame);
+      }
       reset(){this.state='unconfigured'}
       close(){assert.notEqual(this.state,'closed'); this.state='closed'}
     },
@@ -182,6 +188,7 @@ async function check(chunks, expected, invalid=false, overload=false) {
   for(let i=0;i<100 && !cancelled;i++) await new Promise(resolve=>setImmediate(resolve));
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(cancelled,true);
+  frames.forEach(frame=>assert.equal(frame.closed,1));
   assert.deepEqual(decoded.map(c=>c.type),expected);
   if(decoded.length) assert.equal(decoded[0].timestamp,123456);
   if(invalid) assert.match(status.textContent,/Invalid record size/);
@@ -199,6 +206,66 @@ async function check(chunks, expected, invalid=false, overload=false) {
         result = subprocess.run(
             ["node", "-e", harness, json.dumps(script)], capture_output=True, text=True,
             timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_frame_pacing(self):
+        source = (ROOT / "DesktopStream.swift").read_text()
+        presenter = "class FramePresenter" + source.split("class FramePresenter", 1)[1].split("const status =", 1)[0]
+        harness = r"""
+const assert = require('node:assert/strict');
+function frame(ms) {
+  return {timestamp:ms*1000,closed:0,close(){this.closed++;assert.equal(this.closed,1)}};
+}
+const p = new FramePresenter();
+const a = frame(0), b = frame(10), c = frame(20);
+p.enqueue(a,0); p.enqueue(b,10); p.enqueue(c,20);
+assert.equal(p.take(99),null);
+assert.equal(p.take(100),a); a.close();
+assert.equal(p.take(119),null);
+assert.equal(p.take(120),c); c.close();
+assert.equal(b.closed,1);
+assert.equal(p.take(120),null);
+assert.equal(p.take(140),null);
+
+// A delayed animation callback chooses one newest due frame, not a draw burst.
+p.reset();
+const burst = [0,20,40,60,80].map(frame);
+burst.forEach(f=>p.enqueue(f,f.timestamp/1000));
+assert.equal(p.take(180),burst[4]); burst[4].close();
+burst.forEach(f=>assert.equal(f.closed,1));
+assert.equal(p.take(180),null);
+
+// Retained media is bounded and all frames are closed exactly once.
+p.reset();
+const bounded = Array.from({length:30},(_,i)=>frame(i));
+bounded.forEach(f=>p.enqueue(f,f.timestamp/1000));
+assert.equal(p.frames.length,24);
+bounded.slice(0,6).forEach(f=>assert.equal(f.closed,1));
+p.reset(); bounded.forEach(f=>assert.equal(f.closed,1));
+
+// A late source timeline re-anchors instead of immediately draining old timestamps.
+const old = frame(0), late = frame(20);
+p.enqueue(old,0); p.enqueue(late,1000);
+assert.equal(old.closed,1);
+assert.equal(p.take(1099),null);
+assert.equal(p.take(1100),late); late.close();
+p.reset();
+
+// Clock restarts, duplicate timestamps, invalid samples and invalid configuration.
+const previous = frame(5000), restarted = frame(0), duplicate = frame(0), invalid = frame(NaN);
+p.enqueue(previous,0); p.enqueue(restarted,1);
+assert.equal(previous.closed,1);
+p.enqueue(duplicate,2); assert.equal(duplicate.closed,1);
+p.enqueue(invalid,3); assert.equal(invalid.closed,1);
+p.reset(); assert.equal(restarted.closed,1);
+assert.throws(()=>new FramePresenter({fps:0}));
+assert.throws(()=>new FramePresenter({bufferMs:501}));
+assert.throws(()=>new FramePresenter({maxFrames:0}));
+console.log('PASS 50 FPS/100 ms pacing, no catch-up bursts, queue bounds, re-anchor and frame disposal');
+"""
+        result = subprocess.run(
+            ["node", "-e", presenter + harness], capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

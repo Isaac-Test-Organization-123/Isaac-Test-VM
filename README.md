@@ -32,8 +32,20 @@ It does not request Accessibility permission or inject input.
 Stop with Ctrl+C or stop sharing through macOS. Reload the viewer to reconnect.
 
 Defaults: loopback `127.0.0.1`, port **54321**, output width up to 1600 pixels,
-target 60 FPS, aspect ratio preserved. The source may deliver fewer frames.
-The viewer renders immediately; the old experimental pacing buffer is removed.
+capture/encode target 60 FPS, aspect ratio preserved. The source may deliver fewer frames.
+The embedded viewer defaults to a **50 FPS presentation target with a 100 ms
+playout buffer**, using source timestamps to smooth moderate arrival jitter.
+It selects the newest due decoded frame at each presentation opportunity,
+closes superseded frames, and never draws catch-up bursts. The decoded-frame
+queue is capped at 24 frames and resets on visibility changes, decoder resets
+and disconnects. Long stalls re-anchor the timeline.
+
+No extra viewer files or service are needed: the pacing code is embedded in the
+same executable. The `--fps` flag controls capture/encoding, not the viewer's
+50 FPS presentation target. Pacing cannot manufacture missing source frames or
+hide every network stall. The 100 ms buffer intentionally increases visible
+latency; actual display cadence depends on browser scheduling and monitor refresh
+(50 FPS is not perfectly uniform on a 60 Hz display).
 
 ```sh
 ./desktop-stream --port 55001 --width 1280 --fps 30
@@ -93,7 +105,8 @@ python3 test_stream.py
 
 Build first. Tests require Python 3 and Node.js and exercise the executable's CLI,
 HTTP admission/routes, connection limits, and the actual embedded JavaScript
-parser/decoder recovery using synthetic records. A temporary harness also
+parser/decoder recovery and deterministic presentation pacing using synthetic records.
+A temporary harness also
 hardware-encodes generated black pixels and checks the native wire framing.
 They start `--serve-only`,
 which serves HTTP **without initializing AppKit, opening the picker, or starting

@@ -381,21 +381,84 @@ header{padding:10px}canvas{display:block;width:100%;height:calc(100vh - 40px);ob
 <header id="status">Connecting — video only</header><canvas id="screen"></canvas>
 <script>
 'use strict';
+class FramePresenter {
+  constructor({fps = 50, bufferMs = 100, maxFrames = 24} = {}) {
+    if (!Number.isFinite(fps) || fps <= 0 || fps > 120 ||
+        !Number.isFinite(bufferMs) || bufferMs < 0 || bufferMs > 500 ||
+        !Number.isInteger(maxFrames) || maxFrames < 1) throw new Error('Invalid presentation settings');
+    this.intervalMs = 1000 / fps;
+    this.bufferMs = bufferMs;
+    this.maxFrames = maxFrames;
+    this.frames = [];
+    this.reset();
+  }
+  reset() {
+    for (const frame of this.frames) frame.close();
+    this.frames.length = 0;
+    this.sourceOrigin = this.localOrigin = this.nextTick = this.lastSource = null;
+  }
+  enqueue(frame, atMs) {
+    const sourceMs = frame.timestamp / 1000;
+    if (!Number.isFinite(sourceMs) || !Number.isFinite(atMs) ||
+        (this.lastSource !== null && sourceMs <= this.lastSource && sourceMs > this.lastSource - 1000)) {
+      frame.close();
+      return;
+    }
+    const due = this.sourceOrigin === null ? null : this.localOrigin + sourceMs - this.sourceOrigin;
+    // Re-anchor after long stalls or a source-clock restart instead of replaying stale video.
+    if (due === null || sourceMs <= this.lastSource - 1000 ||
+        due < atMs - 250 || due > atMs + this.bufferMs + 150) {
+      this.reset();
+      this.sourceOrigin = sourceMs;
+      this.localOrigin = atMs + this.bufferMs;
+      this.nextTick = this.localOrigin;
+    }
+    this.lastSource = sourceMs;
+    this.frames.push(frame);
+    while (this.frames.length > this.maxFrames) this.frames.shift().close();
+  }
+  take(atMs) {
+    if (this.nextTick === null || atMs < this.nextTick) return null;
+    const tick = this.nextTick + Math.floor((atMs - this.nextTick) / this.intervalMs) * this.intervalMs;
+    this.nextTick = tick + this.intervalMs;
+    const playhead = this.sourceOrigin + tick - this.localOrigin;
+    let selected = null;
+    while (this.frames.length && this.frames[0].timestamp / 1000 <= playhead) {
+      if (selected) selected.close();
+      selected = this.frames.shift();
+    }
+    return selected;
+  }
+}
 const status = document.getElementById('status'), canvas = document.getElementById('screen');
 const context = canvas.getContext('2d');
+const presenter = new FramePresenter();
+let animation = null;
+function present(atMs) {
+  const frame = presenter.take(atMs);
+  if (frame) {
+    try { context.drawImage(frame, 0, 0, canvas.width, canvas.height); }
+    finally { frame.close(); }
+  }
+  animation = requestAnimationFrame(present);
+}
+document.addEventListener('visibilitychange', () => presenter.reset());
 let decoder, configKey = '', needKey = true;
 function consume(kind, timestamp, payload) {
   if (kind === 0) {
     const text = new TextDecoder().decode(payload);
     if (text === configKey && decoder?.state === 'configured') return;
     const config = JSON.parse(text);
+    presenter.reset();
     if (decoder && decoder.state !== 'closed') decoder.close();
     decoder = new VideoDecoder({
       output(frame) {
-        try { context.drawImage(frame, 0, 0, canvas.width, canvas.height); }
-        finally { frame.close(); }
+        if (document.hidden) frame.close();
+        else presenter.enqueue(frame, performance.now());
       },
-      error(error) { configKey = ''; needKey = true; status.textContent = error.message; }
+      error(error) {
+        presenter.reset(); configKey = ''; needKey = true; status.textContent = error.message;
+      }
     });
     decoder.configure({
       codec: config.codec,
@@ -407,12 +470,12 @@ function consume(kind, timestamp, payload) {
   } else if (kind === 1 || kind === 2) {
     if (decoder?.state !== 'configured') return;
     if (decoder.decodeQueueSize > 8) {
-      decoder.reset(); configKey = ''; needKey = true; return;
+      decoder.reset(); presenter.reset(); configKey = ''; needKey = true; return;
     }
     if (needKey && kind !== 1) return;
     needKey = false;
     decoder.decode(new EncodedVideoChunk({type: kind === 1 ? 'key' : 'delta', timestamp, data: payload}));
-    status.textContent = 'Live — video only';
+    status.textContent = 'Live — video only · 50 FPS target · 100 ms buffer';
   } else throw new Error('Unknown stream record');
 }
 async function run() {
@@ -422,6 +485,7 @@ async function run() {
   if (!response.ok) throw new Error(`Stream HTTP ${response.status}`);
   const reader = response.body.getReader();
   let buffer = new Uint8Array(0);
+  animation = requestAnimationFrame(present);
   try {
     while (true) {
       const {value, done} = await reader.read();
@@ -441,7 +505,9 @@ async function run() {
     }
   } finally {
     await reader.cancel().catch(() => {});
-    decoder?.close();
+    if (animation !== null) cancelAnimationFrame(animation);
+    presenter.reset();
+    if (decoder && decoder.state !== 'closed') decoder.close();
   }
 }
 run().catch(error => { status.textContent = error.message; });
